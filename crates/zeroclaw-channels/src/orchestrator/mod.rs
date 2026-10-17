@@ -11986,11 +11986,23 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 })
                 .collect()
         };
-        for (alias, private_key, relays, ack_reactions) in nostr_jobs {
+        for (alias, private_key, relays, _) in nostr_jobs {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
+            };
+            let ack_reactions: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .nostr
+                        .get(&alias)
+                        .is_some_and(|ns| ns.effective_ack_reactions())
+                })
             };
             channels.push(ConfiguredChannel {
                 display_name: "Nostr",
@@ -12755,11 +12767,23 @@ pub async fn start_channels(
                         )
                     })
                     .collect();
-                for (alias, private_key, relays, ack_reactions) in nostr_jobs {
+                for (alias, private_key, relays, _) in nostr_jobs {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
+                    };
+                    let ack_reactions: Arc<dyn Fn() -> bool + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || {
+                            cfg_arc
+                                .read()
+                                .channels
+                                .nostr
+                                .get(&alias)
+                                .is_some_and(|ns| ns.effective_ack_reactions())
+                        })
                     };
                     configured_channels.push(ConfiguredChannel {
                         display_name: "Nostr",
