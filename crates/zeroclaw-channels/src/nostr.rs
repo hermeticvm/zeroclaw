@@ -24,6 +24,11 @@ fn is_ackable_rumor_kind(kind: Kind) -> bool {
     matches!(kind.as_u16(), 14 | 15)
 }
 
+/// Most reactions sent per message: the receipt ack plus one completion
+/// reaction. Gift-wrapped reactions cannot be retracted, so this bounds what
+/// accumulates on a message in the sender's client.
+const MAX_REACTIONS_PER_MESSAGE: usize = 2;
+
 /// The inner (rumor) message an acknowledgement reaction refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AckTarget {
@@ -31,7 +36,13 @@ struct AckTarget {
     rumor_id: EventId,
     rumor_kind: Kind,
     sender: PublicKey,
-    reacted: bool,
+}
+
+#[derive(Debug)]
+struct AckEntry {
+    target: AckTarget,
+    /// Emoji already sent (or in flight) for this message.
+    sent: Vec<String>,
 }
 
 /// Bounded map from `ChannelMessage::id` (the gift-wrap event id) to the
@@ -40,12 +51,16 @@ struct AckTarget {
 #[derive(Debug, Default)]
 struct AckTargets {
     order: VecDeque<String>,
-    map: HashMap<String, AckTarget>,
+    map: HashMap<String, AckEntry>,
 }
 
 impl AckTargets {
     fn insert(&mut self, message_id: String, target: AckTarget) {
-        if self.map.insert(message_id.clone(), target).is_none() {
+        let entry = AckEntry {
+            target,
+            sent: Vec::new(),
+        };
+        if self.map.insert(message_id.clone(), entry).is_none() {
             self.order.push_back(message_id);
         }
         while self.order.len() > ACK_TARGET_CAPACITY {
@@ -55,16 +70,28 @@ impl AckTargets {
         }
     }
 
-    /// Claim the single reaction allowed for `message_id`. Gift-wrapped
-    /// reactions cannot be retracted, so later calls (e.g. the
-    /// orchestrator's 👀 → ✅ completion swap) are no-ops.
-    fn claim(&mut self, message_id: &str, recipient: &str) -> Option<AckTarget> {
-        let target = self.map.get_mut(message_id)?;
-        if target.reacted || target.sender.to_hex() != recipient {
+    /// Reserve a reaction with `emoji` on `message_id`. Each emoji is sent at
+    /// most once per message and at most `MAX_REACTIONS_PER_MESSAGE` in
+    /// total, so the orchestrator's receipt ack and its completion reaction
+    /// (👀 then ✅/⚠️, or the no-reply emoji) both go out, while repeats and
+    /// further reactions are dropped.
+    fn claim(&mut self, message_id: &str, recipient: &str, emoji: &str) -> Option<AckTarget> {
+        let entry = self.map.get_mut(message_id)?;
+        if entry.target.sender.to_hex() != recipient
+            || entry.sent.len() >= MAX_REACTIONS_PER_MESSAGE
+            || entry.sent.iter().any(|e| e == emoji)
+        {
             return None;
         }
-        target.reacted = true;
-        Some(target.clone())
+        entry.sent.push(emoji.to_string());
+        Some(entry.target.clone())
+    }
+
+    /// Undo a `claim` whose reaction could not be delivered.
+    fn release(&mut self, message_id: &str, emoji: &str) {
+        if let Some(entry) = self.map.get_mut(message_id) {
+            entry.sent.retain(|e| e != emoji);
+        }
     }
 }
 
@@ -158,9 +185,39 @@ impl NostrChannel {
                 rumor_id,
                 rumor_kind: rumor.kind,
                 sender: rumor.pubkey,
-                reacted: false,
             },
         );
+    }
+
+    /// Build the gift wrap carrying a reaction to `message_id`, or `None`
+    /// when no reaction may be sent for it. A returned wrap holds its
+    /// emoji's slot in `ack_targets`; release it if delivery fails.
+    async fn ack_reaction_wrap(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<Option<Event>> {
+        if !self.ack_reactions {
+            return Ok(None);
+        }
+        let Some(target) = self.ack_targets.lock().claim(message_id, recipient, emoji) else {
+            return Ok(None);
+        };
+        let rumor = build_ack_reaction_rumor(self.public_key, &target, emoji);
+        let wrap = match self.client.signer().await {
+            Ok(signer) => EventBuilder::gift_wrap(&signer, &target.sender, rumor, [])
+                .await
+                .map_err(anyhow::Error::from),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        match wrap {
+            Ok(wrap) => Ok(Some(wrap)),
+            Err(e) => {
+                self.ack_targets.lock().release(message_id, emoji);
+                Err(e).context("Failed to build NIP-17 ack reaction")
+            }
+        }
     }
 
     /// Return the alias under `[channels.nostr.<alias>]` that this
@@ -467,22 +524,27 @@ impl Channel for NostrChannel {
     /// Only messages that arrived as NIP-17 gift wraps are reacted to, and
     /// the reaction rumor is gift-wrapped to the sender, so nothing public
     /// links the bot to the conversation. NIP-04 (kind 4) DMs are skipped:
-    /// a reaction to them would have to be a public kind-7 event. At most
-    /// one reaction is sent per message because it cannot be retracted.
+    /// a reaction to them would have to be a public kind-7 event.
+    ///
+    /// A gift-wrapped reaction cannot be retracted (the rumor is unsigned,
+    /// so NIP-09 deletion does not apply), which is why `remove_reaction`
+    /// stays a no-op. The orchestrator's 👀 → ✅/⚠️ swap therefore shows up
+    /// as two reactions on the message: 👀 on receipt, then the completion
+    /// emoji. `AckTargets::claim` owns the per-message limit.
     async fn add_reaction(
         &self,
         channel_id: &str,
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
-        if !self.ack_reactions {
-            return Ok(());
-        }
-        let Some(target) = self.ack_targets.lock().claim(message_id, channel_id) else {
+        let Some(wrap) = self
+            .ack_reaction_wrap(channel_id, message_id, emoji)
+            .await?
+        else {
             return Ok(());
         };
-        let rumor = build_ack_reaction_rumor(self.public_key, &target, emoji);
-        if let Err(e) = self.client.gift_wrap(&target.sender, rumor, []).await {
+        if let Err(e) = self.client.send_event(&wrap).await {
+            self.ack_targets.lock().release(message_id, emoji);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -664,81 +726,9 @@ mod tests {
         assert_eq!(map.get(&pk), None);
     }
 
-    fn ack_target(sender: PublicKey) -> AckTarget {
-        AckTarget {
-            rumor_id: EventId::all_zeros(),
-            rumor_kind: Kind::PrivateDirectMessage,
-            sender,
-            reacted: false,
-        }
-    }
-
-    #[test]
-    fn ack_targets_claim_only_once() {
-        let sender = Keys::generate().public_key();
-        let mut targets = AckTargets::default();
-        targets.insert("wrap".into(), ack_target(sender));
-        assert!(targets.claim("wrap", &sender.to_hex()).is_some());
-        assert!(targets.claim("wrap", &sender.to_hex()).is_none());
-    }
-
-    #[test]
-    fn ack_targets_unknown_or_mismatched_recipient_is_none() {
-        let sender = Keys::generate().public_key();
-        let other = Keys::generate().public_key();
-        let mut targets = AckTargets::default();
-        targets.insert("wrap".into(), ack_target(sender));
-        assert!(targets.claim("nip04-event-id", &sender.to_hex()).is_none());
-        assert!(targets.claim("wrap", &other.to_hex()).is_none());
-        assert!(targets.claim("wrap", &sender.to_hex()).is_some());
-    }
-
-    #[test]
-    fn ack_targets_are_bounded() {
-        let sender = Keys::generate().public_key();
-        let mut targets = AckTargets::default();
-        for i in 0..(ACK_TARGET_CAPACITY + 10) {
-            targets.insert(format!("wrap{i}"), ack_target(sender));
-        }
-        assert_eq!(targets.map.len(), ACK_TARGET_CAPACITY);
-        assert_eq!(targets.order.len(), ACK_TARGET_CAPACITY);
-        assert!(targets.claim("wrap0", &sender.to_hex()).is_none());
-        let newest = format!("wrap{}", ACK_TARGET_CAPACITY + 9);
-        assert!(targets.claim(&newest, &sender.to_hex()).is_some());
-    }
-
-    #[test]
-    fn ack_reaction_rumor_references_inner_rumor() {
-        let bot = Keys::generate().public_key();
-        let sender = Keys::generate().public_key();
-        let mut dm = EventBuilder::private_msg_rumor(bot, "hi").build(sender);
-        let target = AckTarget {
-            rumor_id: dm.id(),
-            rumor_kind: dm.kind,
-            sender,
-            reacted: false,
-        };
-        let reaction = build_ack_reaction_rumor(bot, &target, "\u{1F440}");
-        assert_eq!(reaction.kind, Kind::Reaction);
-        assert_eq!(reaction.pubkey, bot);
-        assert_eq!(reaction.content, "\u{1F440}");
-        assert_eq!(reaction.tags.event_ids().next(), Some(&dm.id()));
-        assert_eq!(reaction.tags.public_keys().next(), Some(&sender));
-        let k = reaction
-            .tags
-            .iter()
-            .find(|t| t.kind() == TagKind::k())
-            .and_then(|t| t.content());
-        assert_eq!(k, Some("14"));
-    }
-
-    #[test]
-    fn only_chat_rumor_kinds_are_ackable() {
-        assert!(is_ackable_rumor_kind(Kind::PrivateDirectMessage));
-        assert!(is_ackable_rumor_kind(Kind::from(15)));
-        assert!(!is_ackable_rumor_kind(Kind::Reaction));
-        assert!(!is_ackable_rumor_kind(Kind::EncryptedDirectMessage));
-    }
+    const EYES: &str = "\u{1F440}";
+    const CHECK: &str = "\u{2705}";
+    const WARNING: &str = "\u{26A0}\u{FE0F}";
 
     async fn test_channel(ack: bool) -> NostrChannel {
         let keys = Keys::generate();
@@ -753,46 +743,157 @@ mod tests {
         .with_ack_reactions(ack)
     }
 
-    #[tokio::test]
-    async fn ack_reactions_default_off_and_records_nothing() {
-        let ch = test_channel(false).await;
-        assert!(!ch.ack_reactions);
-        let sender = Keys::generate().public_key();
-        let rumor = EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender);
-        ch.remember_ack_target("wrap".into(), &rumor);
-        assert!(ch.ack_targets.lock().map.is_empty());
-        // Disabled channel never sends, even for an unknown id.
-        ch.add_reaction(&sender.to_hex(), "wrap", "\u{1F440}")
+    /// Deliver a NIP-17 DM from `sender` to `ch` the way `listen` records it.
+    fn receive_dm(ch: &NostrChannel, sender: &Keys, wrap_id: &str) -> UnsignedEvent {
+        let mut rumor =
+            EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender.public_key());
+        rumor.ensure_id();
+        ch.remember_ack_target(wrap_id.to_string(), &rumor);
+        rumor
+    }
+
+    /// The reaction rumor `ch` would send for `emoji`, as the sender's client
+    /// sees it after unwrapping. `None` means nothing would be sent.
+    async fn sent_reaction(
+        ch: &NostrChannel,
+        sender: &Keys,
+        wrap_id: &str,
+        emoji: &str,
+    ) -> Option<UnsignedEvent> {
+        let wrap = ch
+            .ack_reaction_wrap(&sender.public_key().to_hex(), wrap_id, emoji)
             .await
-            .unwrap();
+            .unwrap()?;
+        assert_eq!(wrap.kind, Kind::GiftWrap);
+        assert_eq!(wrap.tags.public_keys().next(), Some(&sender.public_key()));
+        let unwrapped = UnwrappedGift::from_gift_wrap(sender, &wrap).await.unwrap();
+        assert_eq!(unwrapped.sender, ch.public_key);
+        Some(unwrapped.rumor)
     }
 
     #[tokio::test]
-    async fn remember_ack_target_recomputes_rumor_id_and_skips_reactions() {
+    async fn ack_reaction_is_gift_wrapped_to_sender_and_references_rumor() {
         let ch = test_channel(true).await;
-        let sender = Keys::generate().public_key();
-        let mut rumor = EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender);
+        let sender = Keys::generate();
+        let dm = receive_dm(&ch, &sender, "wrap");
+
+        let reaction = sent_reaction(&ch, &sender, "wrap", EYES).await.unwrap();
+        assert_eq!(reaction.kind, Kind::Reaction);
+        assert_eq!(reaction.pubkey, ch.public_key);
+        assert_eq!(reaction.content, EYES);
+        assert_eq!(reaction.tags.event_ids().next(), dm.id.as_ref());
+        assert_eq!(
+            reaction.tags.public_keys().next(),
+            Some(&sender.public_key())
+        );
+        let k = reaction
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::k())
+            .and_then(|t| t.content());
+        assert_eq!(k, Some("14"));
+    }
+
+    #[tokio::test]
+    async fn ack_reaction_references_recomputed_rumor_id() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        let mut rumor =
+            EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender.public_key());
         let real_id = rumor.id();
+        // A sender-supplied `id` in the rumor JSON must not be trusted.
         let mut spoofed = rumor.clone();
         spoofed.id = Some(EventId::all_zeros());
         ch.remember_ack_target("wrap".into(), &spoofed);
-        assert_eq!(ch.ack_targets.lock().map["wrap"].rumor_id, real_id);
 
-        let reaction = EventBuilder::new(Kind::Reaction, "+").build(sender);
-        ch.remember_ack_target("wrap-reaction".into(), &reaction);
-        assert!(!ch.ack_targets.lock().map.contains_key("wrap-reaction"));
+        let reaction = sent_reaction(&ch, &sender, "wrap", EYES).await.unwrap();
+        assert_eq!(reaction.tags.event_ids().next(), Some(&real_id));
     }
 
     #[tokio::test]
-    async fn add_reaction_skips_non_nip17_messages() {
-        // A NIP-04 message id is never recorded, so no event (public or
-        // wrapped) is built for it.
+    async fn receipt_then_one_completion_reaction_per_message() {
         let ch = test_channel(true).await;
-        let sender = Keys::generate().public_key();
-        ch.add_reaction(&sender.to_hex(), "nip04-event-id", "\u{1F440}")
+        let sender = Keys::generate();
+        receive_dm(&ch, &sender, "wrap");
+
+        assert!(sent_reaction(&ch, &sender, "wrap", EYES).await.is_some());
+        assert!(sent_reaction(&ch, &sender, "wrap", EYES).await.is_none());
+        let done = sent_reaction(&ch, &sender, "wrap", CHECK).await.unwrap();
+        assert_eq!(done.content, CHECK);
+        assert!(sent_reaction(&ch, &sender, "wrap", WARNING).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_reaction_for_nip04_unknown_or_foreign_recipient() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        let other = Keys::generate();
+        receive_dm(&ch, &sender, "wrap");
+
+        // NIP-04 message ids are never recorded.
+        assert!(
+            sent_reaction(&ch, &sender, "nip04-event-id", EYES)
+                .await
+                .is_none()
+        );
+        assert!(sent_reaction(&ch, &other, "wrap", EYES).await.is_none());
+        ch.add_reaction(&sender.public_key().to_hex(), "nip04-event-id", EYES)
             .await
             .unwrap();
-        assert!(ch.ack_targets.lock().map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_reaction_to_non_chat_rumors() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        let reaction = EventBuilder::new(Kind::Reaction, "+").build(sender.public_key());
+        ch.remember_ack_target("wrap".into(), &reaction);
+        assert!(sent_reaction(&ch, &sender, "wrap", EYES).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ack_reactions_default_off() {
+        let keys = Keys::generate();
+        let ch = NostrChannel::new(
+            &keys.secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+        )
+        .await
+        .unwrap();
+        let sender = Keys::generate();
+        receive_dm(&ch, &sender, "wrap");
+        assert!(sent_reaction(&ch, &sender, "wrap", EYES).await.is_none());
+        ch.add_reaction(&sender.public_key().to_hex(), "wrap", EYES)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oldest_messages_stop_being_reactable() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        for i in 0..(ACK_TARGET_CAPACITY + 10) {
+            receive_dm(&ch, &sender, &format!("wrap{i}"));
+        }
+        assert!(sent_reaction(&ch, &sender, "wrap0", EYES).await.is_none());
+        let newest = format!("wrap{}", ACK_TARGET_CAPACITY + 9);
+        assert!(sent_reaction(&ch, &sender, &newest, EYES).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_does_not_use_up_the_reaction() {
+        // No relays are configured, so sending fails.
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        receive_dm(&ch, &sender, "wrap");
+        assert!(
+            ch.add_reaction(&sender.public_key().to_hex(), "wrap", EYES)
+                .await
+                .is_err()
+        );
+        assert!(sent_reaction(&ch, &sender, "wrap", EYES).await.is_some());
     }
 
     #[tokio::test]
