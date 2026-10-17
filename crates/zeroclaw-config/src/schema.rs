@@ -18792,11 +18792,34 @@ pub struct NostrConfig {
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
 
+    /// Send a NIP-25 acknowledgement reaction (👀) when an allowlisted
+    /// NIP-17 DM is accepted for processing. The reaction is itself
+    /// NIP-17/NIP-59 gift-wrapped to the sender and references the inner
+    /// rumor id; no public reaction is ever published, and legacy NIP-04
+    /// DMs are never reacted to. Gift-wrapped reactions cannot be
+    /// retracted, so only the receipt ack is sent (no 👀 → ✅ swap).
+    ///
+    /// Unlike the other channels' overrides, `None` does NOT fall back to
+    /// `[channels].ack_reactions`: Nostr acks are opt-in because not every
+    /// client renders gift-wrapped reactions. Default: `None` (off).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+impl NostrConfig {
+    /// Effective acknowledgement-reaction setting for this Nostr channel.
+    /// Opt-in: an unset `ack_reactions` resolves to `false` regardless of
+    /// `[channels].ack_reactions` (see the field docs for why).
+    pub fn effective_ack_reactions(&self) -> bool {
+        self.ack_reactions.unwrap_or(false)
+    }
 }
 
 impl ChannelConfig for NostrConfig {
@@ -36031,6 +36054,27 @@ url = "http://localhost:8080/mcp"
         "#;
         let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.ack_reactions, None);
+    }
+
+    #[test]
+    async fn nostr_config_ack_reactions_missing_is_off() {
+        let toml_str = r#"
+            private_key = "nsec1test"
+        "#;
+        let cfg: NostrConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, None);
+        assert!(!cfg.effective_ack_reactions());
+    }
+
+    #[test]
+    async fn nostr_config_ack_reactions_true_deserializes() {
+        let toml_str = r#"
+            private_key = "nsec1test"
+            ack_reactions = true
+        "#;
+        let cfg: NostrConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(true));
+        assert!(cfg.effective_ack_reactions());
     }
 
     #[test]

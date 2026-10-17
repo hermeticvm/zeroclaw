@@ -6083,6 +6083,14 @@ fn resolve_channel_ack_reactions(
             .get(alias)
             .and_then(|c| c.ack_reactions)
             .unwrap_or(ctx.ack_reactions),
+        // Nostr acks are opt-in per channel and do not inherit the global
+        // default; see `NostrConfig::ack_reactions`.
+        "nostr" => ctx
+            .prompt_config
+            .channels
+            .nostr
+            .get(alias)
+            .is_some_and(|c| c.effective_ack_reactions()),
         _ => ctx.ack_reactions,
     }
 }
@@ -11955,7 +11963,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         // Materialize the work list into owned values BEFORE any `.await`
         // so the RwLockReadGuard is dropped before the async constructor
         // runs (parking_lot guards are not Send).
-        let nostr_jobs: Vec<(String, String, Vec<String>)> = {
+        let nostr_jobs: Vec<(String, String, Vec<String>, bool)> = {
             let config = config_arc.read();
             // Share the same gate as the Discord/shared-collector path so
             // theinvariant ("a disabled agent must not bring its
@@ -11968,10 +11976,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 .iter()
                 .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
                 .filter(|(_, ns)| ns.enabled)
-                .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
+                .map(|(alias, ns)| {
+                    (
+                        alias.clone(),
+                        ns.private_key.clone(),
+                        ns.relays.clone(),
+                        ns.effective_ack_reactions(),
+                    )
+                })
                 .collect()
         };
-        for (alias, private_key, relays) in nostr_jobs {
+        for (alias, private_key, relays, ack_reactions) in nostr_jobs {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
@@ -11981,7 +11996,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 display_name: "Nostr",
                 alias: Some(alias.clone()),
                 channel: Arc::new(
-                    NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                    NostrChannel::new(&private_key, relays, alias, peer_resolver)
+                        .await?
+                        .with_ack_reactions(ack_reactions),
                 ),
             });
         }
@@ -12723,15 +12740,22 @@ pub async fn start_channels(
                 // `.await` so we don't hold any lock across the async
                 // constructor (parking_lot guards are not Send). Mirrors
                 // the same pattern in `doctor_channels`.
-                let nostr_jobs: Vec<(String, String, Vec<String>)> = config
+                let nostr_jobs: Vec<(String, String, Vec<String>, bool)> = config
                     .channels
                     .nostr
                     .iter()
                     .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
                     .filter(|(_, ns)| ns.enabled)
-                    .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
+                    .map(|(alias, ns)| {
+                        (
+                            alias.clone(),
+                            ns.private_key.clone(),
+                            ns.relays.clone(),
+                            ns.effective_ack_reactions(),
+                        )
+                    })
                     .collect();
-                for (alias, private_key, relays) in nostr_jobs {
+                for (alias, private_key, relays, ack_reactions) in nostr_jobs {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
                         let alias = alias.clone();
@@ -12741,7 +12765,9 @@ pub async fn start_channels(
                         display_name: "Nostr",
                         alias: Some(alias.clone()),
                         channel: Arc::new(
-                            NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                            NostrChannel::new(&private_key, relays, alias, peer_resolver)
+                                .await?
+                                .with_ack_reactions(ack_reactions),
                         ),
                     });
                 }
