@@ -11963,7 +11963,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         // Materialize the work list into owned values BEFORE any `.await`
         // so the RwLockReadGuard is dropped before the async constructor
         // runs (parking_lot guards are not Send).
-        let nostr_jobs: Vec<(String, String, Vec<String>, bool)> = {
+        let nostr_jobs: Vec<(String, String, Vec<String>, std::path::PathBuf)> = {
             let config = config_arc.read();
             // Share the same gate as the Discord/shared-collector path so
             // theinvariant ("a disabled agent must not bring its
@@ -11981,12 +11981,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                         alias.clone(),
                         ns.private_key.clone(),
                         ns.relays.clone(),
-                        ns.effective_ack_reactions(),
+                        config.channel_workspace_dir(&format!("nostr.{alias}")),
                     )
                 })
                 .collect()
         };
-        for (alias, private_key, relays, _) in nostr_jobs {
+        for (alias, private_key, relays, workspace_dir) in nostr_jobs {
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
@@ -12010,7 +12010,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 channel: Arc::new(
                     NostrChannel::new(&private_key, relays, alias, peer_resolver)
                         .await?
-                        .with_ack_reactions(ack_reactions),
+                        .with_ack_reactions(ack_reactions)
+                        .with_workspace_dir(workspace_dir),
                 ),
             });
         }
@@ -12752,7 +12753,7 @@ pub async fn start_channels(
                 // `.await` so we don't hold any lock across the async
                 // constructor (parking_lot guards are not Send). Mirrors
                 // the same pattern in `doctor_channels`.
-                let nostr_jobs: Vec<(String, String, Vec<String>, bool)> = config
+                let nostr_jobs: Vec<(String, String, Vec<String>, std::path::PathBuf)> = config
                     .channels
                     .nostr
                     .iter()
@@ -12763,11 +12764,11 @@ pub async fn start_channels(
                             alias.clone(),
                             ns.private_key.clone(),
                             ns.relays.clone(),
-                            ns.effective_ack_reactions(),
+                            config.channel_workspace_dir(&format!("nostr.{alias}")),
                         )
                     })
                     .collect();
-                for (alias, private_key, relays, _) in nostr_jobs {
+                for (alias, private_key, relays, workspace_dir) in nostr_jobs {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
                         let alias = alias.clone();
@@ -12791,7 +12792,8 @@ pub async fn start_channels(
                         channel: Arc::new(
                             NostrChannel::new(&private_key, relays, alias, peer_resolver)
                                 .await?
-                                .with_ack_reactions(ack_reactions),
+                                .with_ack_reactions(ack_reactions)
+                                .with_workspace_dir(workspace_dir),
                         ),
                     });
                 }

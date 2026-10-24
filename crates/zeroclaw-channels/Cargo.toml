@@ -72,6 +72,8 @@ matrix-sdk = { version = "0.18", optional = true, default-features = false, feat
   "sqlite",
 ] }
 mime_guess = { version = "2", optional = true }
+# NIP-17 kind 15 file messages encrypt the file with AES-GCM.
+aes-gcm = { version = "0.10", optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = [
   "nip04",
   "nip59",
@@ -225,7 +227,7 @@ channel-git = ["provider-github", "provider-gitea"]
 provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
 provider-gitea = []
 channel-line = ["dep:axum"]
-channel-nostr = ["dep:nostr-sdk"]
+channel-nostr = ["dep:aes-gcm", "dep:nostr-sdk"]
 whatsapp-web = [
   "dep:bytes",
   "dep:qrcode",
