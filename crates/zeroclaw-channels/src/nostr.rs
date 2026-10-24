@@ -253,6 +253,14 @@ impl Channel for NostrChannel {
         "nostr"
     }
 
+    /// The listener only accepts NIP-04 and NIP-17 DMs, and `reply_target`
+    /// is always the sender's pubkey: even a message from a NIP-17 group chat
+    /// is answered to its sender alone. Every such message is one-to-one, so
+    /// the orchestrator skips the reply-intent precheck and always answers.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        PublicKey::parse(&msg.reply_target).is_ok()
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let recipient =
             PublicKey::parse(&message.recipient).context("Invalid recipient Nostr public key")?;
@@ -648,6 +656,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ch.name(), "nostr");
+    }
+
+    #[tokio::test]
+    async fn is_direct_message_true_for_sender_pubkey_reply_target() {
+        let ch = test_channel(false).await;
+        let sender = Keys::generate().public_key();
+        let hex_dm = ChannelMessage {
+            reply_target: sender.to_hex(),
+            ..Default::default()
+        };
+        let npub_dm = ChannelMessage {
+            reply_target: sender.to_bech32().unwrap(),
+            ..Default::default()
+        };
+        let no_target = ChannelMessage::default();
+        assert!(ch.is_direct_message(&hex_dm));
+        assert!(ch.is_direct_message(&npub_dm));
+        assert!(!ch.is_direct_message(&no_target));
     }
 
     #[tokio::test]
