@@ -39,6 +39,223 @@ fn require_relay_acceptance(output: &Output<EventId>) -> Result<()> {
     anyhow::bail!("no relay accepted the event ({})", failed.join("; "))
 }
 
+/// The multimodal loader's upper limit for one image.
+const MAX_IMAGE_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_MAX_REDIRECTS: usize = 5;
+const NIP17_FILE_MESSAGE: u16 = 15;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileCipher {
+    key: Vec<u8>,
+    nonce: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageFile {
+    url: reqwest::Url,
+    cipher: Option<FileCipher>,
+}
+
+/// Images a message refers to. A NIP-17 file message is the image itself, so
+/// its content (the URL of the encrypted blob) gives way to the image marker.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImageRefs {
+    files: Vec<ImageFile>,
+    from_file_message: bool,
+}
+
+impl ImageRefs {
+    fn in_text(text: &str) -> Self {
+        Self {
+            files: image_urls(text)
+                .into_iter()
+                .map(|url| ImageFile { url, cipher: None })
+                .collect(),
+            from_file_message: false,
+        }
+    }
+
+    fn in_rumor(rumor: &UnsignedEvent) -> Self {
+        if rumor.kind != Kind::from(NIP17_FILE_MESSAGE) {
+            return Self::in_text(&rumor.content);
+        }
+        Self {
+            files: file_message_image(rumor).into_iter().collect(),
+            from_file_message: true,
+        }
+    }
+}
+
+/// HTTPS URLs in `text` whose path names an image format the provider accepts.
+fn image_urls(text: &str) -> Vec<reqwest::Url> {
+    let mut urls = Vec::new();
+    for token in text.split_whitespace() {
+        let Some(start) = token.find("https://") else {
+            continue;
+        };
+        let candidate = token[start..].trim_end_matches(|c: char| {
+            matches!(
+                c,
+                ')' | ']' | '>' | '"' | '\'' | ',' | '.' | '!' | '?' | ';' | ':'
+            )
+        });
+        let Ok(url) = reqwest::Url::parse(candidate) else {
+            continue;
+        };
+        let names_image = url
+            .path()
+            .rsplit_once('.')
+            .and_then(|(_, ext)| zeroclaw_api::media::image_mime_from_extension(ext))
+            .is_some_and(zeroclaw_api::media::is_provider_image_mime);
+        if names_image && !urls.contains(&url) {
+            urls.push(url);
+            if urls.len() == MAX_IMAGES_PER_MESSAGE {
+                break;
+            }
+        }
+    }
+    urls
+}
+
+/// The image a NIP-17 kind 15 file message carries, if it is an image this
+/// channel can fetch and decrypt.
+fn file_message_image(rumor: &UnsignedEvent) -> Option<ImageFile> {
+    let tag = |name: &str| {
+        rumor.tags.iter().find_map(|tag| match tag.as_slice() {
+            [key, value, ..] if key == name => Some(value.as_str()),
+            _ => None,
+        })
+    };
+    if !tag("file-type").is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/")) {
+        return None;
+    }
+    let url = reqwest::Url::parse(rumor.content.trim())
+        .ok()
+        .filter(|url| url.scheme() == "https")?;
+    let cipher = match tag("encryption-algorithm") {
+        None => None,
+        Some(algorithm) if algorithm.eq_ignore_ascii_case("aes-gcm") => Some(FileCipher {
+            key: hex::decode(tag("decryption-key")?).ok()?,
+            nonce: hex::decode(tag("decryption-nonce")?).ok()?,
+        }),
+        Some(_) => return None,
+    };
+    Some(ImageFile { url, cipher })
+}
+
+fn decrypt_file(cipher: &FileCipher, data: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::AesGcm;
+    use aes_gcm::aead::consts::{U12, U16};
+    use aes_gcm::aead::{Aead, KeyInit, Nonce};
+    use aes_gcm::aes::{Aes128, Aes256};
+
+    fn open<C: KeyInit + Aead>(key: &[u8], nonce: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+        C::new_from_slice(key)
+            .map_err(|_| anyhow::Error::msg("invalid AES-GCM key"))?
+            .decrypt(Nonce::<C>::from_slice(nonce), data)
+            .map_err(|_| anyhow::Error::msg("AES-GCM decryption failed"))
+    }
+
+    let (key, nonce) = (cipher.key.as_slice(), cipher.nonce.as_slice());
+    match (key.len(), nonce.len()) {
+        (32, 12) => open::<AesGcm<Aes256, U12>>(key, nonce, data),
+        (32, 16) => open::<AesGcm<Aes256, U16>>(key, nonce, data),
+        (16, 12) => open::<AesGcm<Aes128, U12>>(key, nonce, data),
+        (16, 16) => open::<AesGcm<Aes128, U16>>(key, nonce, data),
+        (key_len, nonce_len) => {
+            anyhow::bail!("unsupported AES-GCM key/nonce length {key_len}/{nonce_len}")
+        }
+    }
+}
+
+fn image_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(IMAGE_DOWNLOAD_TIMEOUT)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if crate::link_enricher::is_ssrf_target(attempt.url().as_str()) {
+                attempt.error("redirect target is not a public HTTP(S) URL")
+            } else if attempt.previous().len() >= IMAGE_MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+}
+
+async fn download_image(client: &reqwest::Client, url: &reqwest::Url) -> Result<Vec<u8>> {
+    if crate::link_enricher::is_ssrf_target(url.as_str()) {
+        anyhow::bail!("not a public HTTP(S) URL");
+    }
+    let mut response = client.get(url.clone()).send().await?.error_for_status()?;
+    let too_large = || {
+        anyhow::Error::msg(format!(
+            "image exceeds {} MB",
+            MAX_IMAGE_DOWNLOAD_BYTES / (1024 * 1024)
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_IMAGE_DOWNLOAD_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if data.len() + chunk.len() > MAX_IMAGE_DOWNLOAD_BYTES {
+            return Err(too_large());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
+/// Saves `data` as `{dir}/{stem}.{ext}` when its bytes are an image the
+/// provider accepts.
+async fn save_image(
+    dir: &std::path::Path,
+    stem: &str,
+    data: Vec<u8>,
+) -> Result<zeroclaw_api::media::MediaAttachment> {
+    let mime = zeroclaw_api::media::image_mime_from_magic(&data)
+        .filter(|mime| zeroclaw_api::media::is_provider_image_mime(mime))
+        .context("not a PNG, JPEG, WebP or GIF image")?;
+    let file_name = format!("{stem}.{}", mime.trim_start_matches("image/"));
+    let path = dir.join(&file_name);
+    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::write(&path, &data).await?;
+    Ok(zeroclaw_api::media::MediaAttachment {
+        file_name,
+        data,
+        mime_type: Some(mime.to_string()),
+        marker: Some(zeroclaw_api::media::RenderedMarker {
+            target: path.display().to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }),
+    })
+}
+
+fn content_with_images(
+    content: &str,
+    from_file_message: bool,
+    attachments: &[zeroclaw_api::media::MediaAttachment],
+) -> String {
+    let markers: Vec<String> = attachments
+        .iter()
+        .filter_map(zeroclaw_api::media::MediaAttachment::marker_target)
+        .map(|target| format!("[IMAGE:{target}]"))
+        .collect();
+    if markers.is_empty() {
+        return content.to_string();
+    }
+    if from_file_message || content.trim().is_empty() {
+        return markers.join("\n");
+    }
+    format!("{content}\n\n{}", markers.join("\n"))
+}
+
 fn warn_ack_reaction_failed(error: &str) {
     ::zeroclaw_log::record!(
         WARN,
@@ -63,6 +280,10 @@ pub struct NostrChannel {
     /// Tracks last-seen protocol per sender pubkey so replies match.
     sender_protocols: Arc<RwLock<HashMap<PublicKey, NostrProtocol>>>,
     ack_reactions: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Inbound images are saved under `{workspace_dir}/nostr_files/`; without
+    /// it they are not downloaded.
+    workspace_dir: Option<std::path::PathBuf>,
+    image_client: reqwest::Client,
 }
 
 impl NostrChannel {
@@ -94,6 +315,10 @@ impl NostrChannel {
             peer_resolver,
             sender_protocols: Arc::new(RwLock::new(HashMap::new())),
             ack_reactions: Arc::new(|| false),
+            workspace_dir: None,
+            image_client: image_client_builder()
+                .build()
+                .context("Failed to build Nostr image download client")?,
         })
     }
 
@@ -120,6 +345,62 @@ impl NostrChannel {
     pub fn with_ack_reactions(mut self, enabled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.ack_reactions = enabled;
         self
+    }
+
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    async fn attach_images(
+        &self,
+        id: &str,
+        content: String,
+        images: ImageRefs,
+    ) -> (String, Vec<zeroclaw_api::media::MediaAttachment>) {
+        if images.files.is_empty() {
+            return (content, vec![]);
+        }
+        let Some(dir) = self.workspace_dir.as_ref().map(|d| d.join("nostr_files")) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Cannot save Nostr image: workspace_dir not configured"
+            );
+            return (content, vec![]);
+        };
+        let mut attachments = Vec::new();
+        for (index, file) in images.files.iter().enumerate() {
+            match self.fetch_image(file, &dir, &format!("{id}_{index}")).await {
+                Ok(attachment) => attachments.push(attachment),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "host": file.url.host_str(),
+                            "error": zeroclaw_runtime::security::scrub(&format!("{e:#}")),
+                        })),
+                    "Failed to load Nostr image"
+                ),
+            }
+        }
+        let content = content_with_images(&content, images.from_file_message, &attachments);
+        (content, attachments)
+    }
+
+    async fn fetch_image(
+        &self,
+        file: &ImageFile,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> Result<zeroclaw_api::media::MediaAttachment> {
+        let mut data = download_image(&self.image_client, &file.url).await?;
+        if let Some(cipher) = &file.cipher {
+            data = decrypt_file(cipher, &data)?;
+        }
+        save_image(dir, stem, data).await
     }
 
     /// `None` unless acks are on and the rumor is a NIP-17 chat message
@@ -385,11 +666,13 @@ impl Channel for NostrChannel {
                                         .write()
                                         .await
                                         .insert(sender, NostrProtocol::Nip04);
+                                    let images = ImageRefs::in_text(&content);
                                     Some((
                                         event.id.to_hex(),
                                         sender.to_hex(),
                                         content,
                                         event.created_at.as_secs(),
+                                        images,
                                     ))
                                 }
                                 Err(e) => {
@@ -425,7 +708,9 @@ impl Channel for NostrChannel {
                                         .await
                                         .insert(rumor.pubkey, NostrProtocol::Nip17);
                                     self.send_ack_reaction_nonblocking(&rumor).await;
-                                    Some(message)
+                                    let (id, sender, content, timestamp) = message;
+                                    let images = ImageRefs::in_rumor(&rumor);
+                                    Some((id, sender, content, timestamp, images))
                                 }
                                 Err(e) => {
                                     ::zeroclaw_log::record!(
@@ -447,7 +732,8 @@ impl Channel for NostrChannel {
                         _ => None,
                     };
 
-                    if let Some((id, sender_hex, content, timestamp)) = result {
+                    if let Some((id, sender_hex, content, timestamp, images)) = result {
+                        let (content, attachments) = self.attach_images(&id, content, images).await;
                         let msg = ChannelMessage {
                             id,
                             sender: sender_hex.clone(),
@@ -458,7 +744,7 @@ impl Channel for NostrChannel {
                             timestamp,
                             thread_ts: None,
                             interruption_scope_id: None,
-                            attachments: vec![],
+                            attachments,
                             subject: None,
 
                             ..Default::default()
@@ -938,5 +1224,298 @@ mod tests {
                 .contains("Invalid recipient Nostr public key"),
             "got: {err:#}"
         );
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    fn file_rumor(content: &str, tags: &[&[&str]]) -> UnsignedEvent {
+        EventBuilder::new(Kind::from(NIP17_FILE_MESSAGE), content)
+            .tags(tags.iter().map(|t| Tag::parse(t.iter().copied()).unwrap()))
+            .build(Keys::generate().public_key())
+    }
+
+    fn encrypt(key: &[u8], nonce: &[u8], data: &[u8]) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        aes_gcm::Aes256Gcm::new_from_slice(key)
+            .unwrap()
+            .encrypt(nonce.into(), data)
+            .unwrap()
+    }
+
+    #[test]
+    fn image_urls_finds_https_images_in_text() {
+        let text = "look (https://i.nostr.build/a.jpg), https://x.test/b.PNG. \
+                    and https://x.test/b.PNG again";
+        assert_eq!(
+            image_urls(text),
+            vec![
+                url("https://i.nostr.build/a.jpg"),
+                url("https://x.test/b.PNG")
+            ]
+        );
+    }
+
+    #[test]
+    fn image_urls_skips_plain_http_non_images_and_unsupported_formats() {
+        let text = "http://x.test/a.jpg https://x.test/page.html https://x.test/a.bmp \
+                    https://x.test/jpg ftp://x.test/a.png";
+        assert!(image_urls(text).is_empty());
+    }
+
+    #[test]
+    fn image_urls_caps_the_number_of_images() {
+        let text: Vec<String> = (0..10)
+            .map(|i| format!("https://x.test/{i}.webp"))
+            .collect();
+        assert_eq!(image_urls(&text.join(" ")).len(), MAX_IMAGES_PER_MESSAGE);
+    }
+
+    #[test]
+    fn encrypted_file_message_yields_its_image() {
+        let rumor = file_rumor(
+            " https://blossom.test/abc ",
+            &[
+                &["file-type", "image/jpeg"],
+                &["encryption-algorithm", "aes-gcm"],
+                &["decryption-key", "000102030405060708090a0b0c0d0e0f"],
+                &["decryption-nonce", "a0a1a2a3a4a5a6a7a8a9aaab"],
+            ],
+        );
+        let refs = ImageRefs::in_rumor(&rumor);
+        assert!(refs.from_file_message);
+        assert_eq!(
+            refs.files,
+            vec![ImageFile {
+                url: url("https://blossom.test/abc"),
+                cipher: Some(FileCipher {
+                    key: (0..16).collect(),
+                    nonce: (0xa0..0xac).collect(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn unencrypted_file_message_has_no_cipher() {
+        let rumor = file_rumor("https://x.test/a", &[&["file-type", "image/png"]]);
+        assert_eq!(
+            file_message_image(&rumor),
+            Some(ImageFile {
+                url: url("https://x.test/a"),
+                cipher: None,
+            })
+        );
+    }
+
+    #[test]
+    fn file_messages_that_are_not_fetchable_images_are_skipped() {
+        let pdf = file_rumor("https://x.test/a", &[&["file-type", "application/pdf"]]);
+        let http = file_rumor("http://x.test/a", &[&["file-type", "image/png"]]);
+        let other_cipher = file_rumor(
+            "https://x.test/a",
+            &[
+                &["file-type", "image/png"],
+                &["encryption-algorithm", "chacha20"],
+            ],
+        );
+        let missing_key = file_rumor(
+            "https://x.test/a",
+            &[
+                &["file-type", "image/png"],
+                &["encryption-algorithm", "aes-gcm"],
+                &["decryption-nonce", "a0a1a2a3a4a5a6a7a8a9aaab"],
+            ],
+        );
+        for rumor in [pdf, http, other_cipher, missing_key] {
+            let refs = ImageRefs::in_rumor(&rumor);
+            assert!(refs.files.is_empty());
+            assert!(refs.from_file_message);
+        }
+    }
+
+    #[test]
+    fn chat_rumor_images_come_from_its_text() {
+        let rumor =
+            EventBuilder::private_msg_rumor(Keys::generate().public_key(), "https://x.test/a.gif")
+                .build(Keys::generate().public_key());
+        assert_eq!(
+            ImageRefs::in_rumor(&rumor),
+            ImageRefs {
+                files: vec![ImageFile {
+                    url: url("https://x.test/a.gif"),
+                    cipher: None,
+                }],
+                from_file_message: false,
+            }
+        );
+    }
+
+    #[test]
+    fn decrypt_file_opens_aes_gcm_and_rejects_bad_input() {
+        let key = [7u8; 32];
+        let nonce = [9u8; 12];
+        let cipher = FileCipher {
+            key: key.to_vec(),
+            nonce: nonce.to_vec(),
+        };
+        assert_eq!(
+            decrypt_file(&cipher, &encrypt(&key, &nonce, PNG)).unwrap(),
+            PNG
+        );
+
+        let wrong_key = FileCipher {
+            key: vec![8; 32],
+            ..cipher.clone()
+        };
+        assert!(decrypt_file(&wrong_key, &encrypt(&key, &nonce, PNG)).is_err());
+
+        let short_nonce = FileCipher {
+            nonce: vec![9; 8],
+            ..cipher
+        };
+        assert!(decrypt_file(&short_nonce, PNG).is_err());
+    }
+
+    #[tokio::test]
+    async fn save_image_writes_loadable_images_with_an_image_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = save_image(dir.path(), "evt_0", PNG.to_vec()).await.unwrap();
+        let path = dir.path().join("evt_0.png");
+        assert_eq!(std::fs::read(&path).unwrap(), PNG);
+        assert_eq!(attachment.file_name, "evt_0.png");
+        assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            attachment.marker,
+            Some(zeroclaw_api::media::RenderedMarker {
+                target: path.display().to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            })
+        );
+        assert!(attachment.channel_rendered_owned_disposition());
+    }
+
+    #[tokio::test]
+    async fn save_image_rejects_other_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            save_image(dir.path(), "a", b"<html>".to_vec())
+                .await
+                .is_err()
+        );
+        assert!(
+            save_image(dir.path(), "b", b"BM\0\0".to_vec())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn content_with_images_appends_or_replaces_markers() {
+        let image = |target: &str| zeroclaw_api::media::MediaAttachment {
+            marker: Some(zeroclaw_api::media::RenderedMarker {
+                target: target.into(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            }),
+            ..Default::default()
+        };
+        let both = [image("/w/a.png"), image("/w/b.jpeg")];
+        assert_eq!(
+            content_with_images("see https://x.test/a.png", false, &both),
+            "see https://x.test/a.png\n\n[IMAGE:/w/a.png]\n[IMAGE:/w/b.jpeg]"
+        );
+        assert_eq!(
+            content_with_images("https://blossom.test/abc", true, &both[..1]),
+            "[IMAGE:/w/a.png]"
+        );
+        assert_eq!(
+            content_with_images("https://blossom.test/abc", true, &[]),
+            "https://blossom.test/abc"
+        );
+    }
+
+    async fn image_server(body: Vec<u8>) -> (wiremock::MockServer, reqwest::Client) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let client = image_client_builder()
+            .resolve("public.test", *server.address())
+            .build()
+            .unwrap();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn download_image_fetches_public_urls_within_the_size_limit() {
+        let (server, client) = image_server(PNG.to_vec()).await;
+        let port = server.address().port();
+        let public = url(&format!("http://public.test:{port}/img"));
+        assert_eq!(download_image(&client, &public).await.unwrap(), PNG);
+
+        let private = url(&format!("http://127.0.0.1:{port}/img"));
+        assert!(download_image(&client, &private).await.is_err());
+
+        let (server, client) = image_server(vec![0; MAX_IMAGE_DOWNLOAD_BYTES + 1]).await;
+        let port = server.address().port();
+        let err = download_image(&client, &url(&format!("http://public.test:{port}/img")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn encrypted_file_message_becomes_an_image_attachment() {
+        let key = [3u8; 32];
+        let nonce = [4u8; 12];
+        let (server, client) = image_server(encrypt(&key, &nonce, PNG)).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ch = test_channel(false)
+            .await
+            .with_workspace_dir(workspace.path().to_path_buf());
+        ch.image_client = client;
+        let images = ImageRefs {
+            files: vec![ImageFile {
+                url: url(&format!(
+                    "http://public.test:{}/img",
+                    server.address().port()
+                )),
+                cipher: Some(FileCipher {
+                    key: key.to_vec(),
+                    nonce: nonce.to_vec(),
+                }),
+            }],
+            from_file_message: true,
+        };
+
+        let (content, attachments) = ch
+            .attach_images("evt", "https://blossom.test/abc".into(), images)
+            .await;
+
+        let path = workspace.path().join("nostr_files").join("evt_0.png");
+        assert_eq!(content, format!("[IMAGE:{}]", path.display()));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].data, PNG);
+        assert_eq!(std::fs::read(path).unwrap(), PNG);
+    }
+
+    #[tokio::test]
+    async fn images_are_not_downloaded_without_a_workspace() {
+        let ch = test_channel(false).await;
+        let images = ImageRefs::in_text("https://x.test/a.png");
+        let (content, attachments) = ch
+            .attach_images("evt", "https://x.test/a.png".into(), images)
+            .await;
+        assert_eq!(content, "https://x.test/a.png");
+        assert!(attachments.is_empty());
     }
 }
