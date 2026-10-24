@@ -42,6 +42,7 @@ external_peers = ["zeroclaw_user"]
 - **Auth:** raw private key (`nsec` bech32 or hex).
 - **Inbound:** kind-1 (text), kind-4 (DM, NIP-04), and kind-1059 (gift-wrap, NIP-17). A gift-wrapped NIP-25 reaction (kind-7 rumor), e.g. a user reacting to one of the agent's replies, is ignored rather than treated as a message.
 - **Outbound:** same kinds. Zap handling is experimental.
+- **Scheduled delivery:** cron jobs can announce to `nostr.<alias>` with `to` set to the recipient's hex or `npub` public key. A job created from a Nostr DM defaults to the sender. Delivery uses the running channel when there is one; otherwise it connects to the configured relays once and sends a NIP-17 DM. A send that no relay accepts fails.
 - **Relays:** the agent connects to all listed relays; use 3–5 for reliability. If `relays` is omitted, ZeroClaw connects to a built-in set of popular public relays.
 - **Acknowledgement reactions:** opt-in via `channels.nostr.<alias>.ack_reactions = true` (default off; unlike other channels it does not inherit `[channels].ack_reactions`). When on, each accepted NIP-17 DM gets a 👀 NIP-25 reaction that is itself gift-wrapped to the sender (`e` = inner kind-14 rumor id, `p` = sender, `k` = `14`), so nothing public is published. Legacy NIP-04 DMs are not reacted to, and the reaction is not swapped to ✅ on completion because gift-wrapped reactions cannot be retracted. Clients that render gift-wrapped DM reactions include Amethyst, 0xchat, Nostur and Wisp; clients that only keep kind-14 rumors (e.g. YakiHonne) silently ignore it.
 

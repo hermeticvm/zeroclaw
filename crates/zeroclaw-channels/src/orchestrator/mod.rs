@@ -13307,6 +13307,29 @@ pub async fn deliver_announcement(
         "signal" => {
             anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
+        #[cfg(feature = "channel-nostr")]
+        "nostr" => {
+            let ns = config
+                .channels
+                .nostr
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("nostr", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            NostrChannel::send_once(
+                &ns.private_key,
+                ns.relays.clone(),
+                alias,
+                peer_resolver,
+                &make_msg(&safe_output),
+            )
+            .await?;
+        }
+        #[cfg(not(feature = "channel-nostr"))]
+        "nostr" => {
+            anyhow::bail!("Nostr channel requires the `channel-nostr` feature");
+        }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
             let wc = config
@@ -35707,6 +35730,77 @@ Done."#;
         assert!(
             msg.contains("[channels.whatsapp.default] not configured"),
             "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-nostr")]
+    async fn deliver_announcement_routes_nostr_to_nostr_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+        let recipient = nostr_sdk::Keys::generate().public_key().to_hex();
+
+        let err = deliver_announcement(&config, "nostr.default", &recipient, None, "hi")
+            .await
+            .expect_err("expected nostr.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "nostr.default must route to the nostr arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.nostr.default] not configured"),
+            "nostr.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-nostr")]
+    async fn deliver_announcement_sends_nostr_from_configured_keys() {
+        // No relays configured: the arm must build a sender from the
+        // configured key and fail at publish time, without network access.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.nostr.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: nostr_sdk::Keys::generate().secret_key().to_secret_hex(),
+                relays: vec![],
+                ..Default::default()
+            },
+        );
+        let recipient = nostr_sdk::Keys::generate().public_key().to_hex();
+
+        let err = deliver_announcement(&config, "nostr.home", &recipient, None, "hi")
+            .await
+            .expect_err("expected nostr.home to fail without relays");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to send NIP-17 message"),
+            "nostr.home must reach the NIP-17 send path; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-nostr")]
+    async fn deliver_announcement_reports_invalid_nostr_key() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.nostr.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "not-a-valid-key".to_string(),
+                ..Default::default()
+            },
+        );
+        let recipient = nostr_sdk::Keys::generate().public_key().to_hex();
+
+        let err = deliver_announcement(&config, "nostr.home", &recipient, None, "hi")
+            .await
+            .expect_err("expected an invalid key to be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Invalid Nostr private key"),
+            "nostr.home must report the invalid key; got: {msg}"
         );
     }
 

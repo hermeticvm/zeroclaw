@@ -9,6 +9,7 @@ const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
     "dingtalk",
     "lark",
     "feishu",
+    "nostr",
 ];
 
 /// Tools that take an optional `channel` arg and otherwise pick
@@ -313,6 +314,32 @@ mod tests {
         );
 
         assert_eq!(args["delivery"]["channel"], "telegram");
+    }
+
+    #[test]
+    fn nostr_turn_defaults_delivery_to_the_sender_pubkey() {
+        let sender = "f".repeat(64);
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "morning briefing",
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "nostr",
+            Some("home"),
+            Some(&sender),
+        );
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "nostr.home",
+                "to": sender,
+            })
+        );
     }
 
     #[test]

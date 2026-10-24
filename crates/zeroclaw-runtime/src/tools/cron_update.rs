@@ -730,10 +730,12 @@ mod tests {
         assert!(channel.is_match("wechat"));
         assert!(channel.is_match("signal"));
         assert!(channel.is_match("email"));
+        assert!(channel.is_match("nostr"));
         assert!(
             channel.is_match("telegram.work"),
             "cron_update must accept the aliased form its description recommends"
         );
+        assert!(channel.is_match("nostr.home"));
         assert!(!channel.is_match("sms"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks

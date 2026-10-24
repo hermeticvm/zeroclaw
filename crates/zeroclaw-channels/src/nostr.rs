@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -18,6 +19,24 @@ const NOSTR_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"]
 
 fn random_nostr_ack_reaction() -> &'static str {
     NOSTR_ACK_REACTIONS[usize::from(rand::random::<u16>()) % NOSTR_ACK_REACTIONS.len()]
+}
+
+/// How long a one-shot send waits for its relays before publishing.
+const SEND_ONCE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The relay pool reports per-relay results and succeeds even when every
+/// relay rejected the event.
+fn require_relay_acceptance(output: &Output<EventId>) -> Result<()> {
+    if !output.success.is_empty() {
+        return Ok(());
+    }
+    let mut failed: Vec<String> = output
+        .failed
+        .iter()
+        .map(|(relay, error)| format!("{relay}: {error}"))
+        .collect();
+    failed.sort();
+    anyhow::bail!("no relay accepted the event ({})", failed.join("; "))
 }
 
 fn warn_ack_reaction_failed(error: &str) {
@@ -76,6 +95,26 @@ impl NostrChannel {
             sender_protocols: Arc::new(RwLock::new(HashMap::new())),
             ack_reactions: Arc::new(|| false),
         })
+    }
+
+    /// Send one message from a short-lived client, for callers without the
+    /// live channel such as cron delivery. Waits for the relays to connect
+    /// first and shuts the client down afterwards.
+    pub async fn send_once(
+        private_key: &str,
+        relays: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        message: &SendMessage,
+    ) -> Result<()> {
+        let channel = Self::new(private_key, relays, alias, peer_resolver).await?;
+        channel
+            .client
+            .wait_for_connection(SEND_ONCE_CONNECT_TIMEOUT)
+            .await;
+        let sent = channel.send(message).await;
+        channel.client.shutdown().await;
+        sent
     }
 
     pub fn with_ack_reactions(mut self, enabled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
@@ -227,10 +266,12 @@ impl Channel for NostrChannel {
         match protocol {
             NostrProtocol::Nip17 => {
                 // NIP-17: gift-wrapped private message
-                self.client
+                let output = self
+                    .client
                     .send_private_msg(recipient, &message.content, None)
                     .await
                     .context("Failed to send NIP-17 message")?;
+                require_relay_acceptance(&output).context("Failed to send NIP-17 message")?;
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -249,10 +290,12 @@ impl Channel for NostrChannel {
                     .context("NIP-04 encryption failed")?;
                 let builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
                     .tag(Tag::public_key(recipient));
-                self.client
+                let output = self
+                    .client
                     .send_event_builder(builder)
                     .await
                     .context("Failed to send NIP-04 message")?;
+                require_relay_acceptance(&output).context("Failed to send NIP-04 message")?;
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -793,5 +836,81 @@ mod tests {
             let map = ch.sender_protocols.read().await;
             assert_eq!(map.get(&pk), Some(&NostrProtocol::Nip17));
         }
+    }
+
+    fn relay_output(success: &[&str], failed: &[(&str, &str)]) -> Output<EventId> {
+        Output {
+            val: EventId::all_zeros(),
+            success: success
+                .iter()
+                .map(|url| RelayUrl::parse(url).unwrap())
+                .collect(),
+            failed: failed
+                .iter()
+                .map(|(url, error)| (RelayUrl::parse(url).unwrap(), (*error).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn send_fails_when_no_relay_accepts_the_event() {
+        let output = relay_output(
+            &[],
+            &[
+                ("wss://b.example.com", "blocked"),
+                ("wss://a.example.com", "rate-limited"),
+            ],
+        );
+        let err = require_relay_acceptance(&output).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "no relay accepted the event (wss://a.example.com: rate-limited; \
+             wss://b.example.com: blocked)"
+        );
+    }
+
+    #[test]
+    fn send_succeeds_when_one_relay_accepts_the_event() {
+        let output = relay_output(
+            &["wss://a.example.com"],
+            &[("wss://b.example.com", "blocked")],
+        );
+        assert!(require_relay_acceptance(&output).is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_once_reports_failure_without_relays() {
+        let recipient = Keys::generate().public_key().to_hex();
+        let err = NostrChannel::send_once(
+            &Keys::generate().secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+            &SendMessage::new("scheduled", &recipient),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to send NIP-17 message"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_once_rejects_invalid_recipient() {
+        let err = NostrChannel::send_once(
+            &Keys::generate().secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+            &SendMessage::new("scheduled", "not-a-pubkey"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid recipient Nostr public key"),
+            "got: {err:#}"
+        );
     }
 }

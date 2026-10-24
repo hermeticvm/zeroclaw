@@ -1237,6 +1237,7 @@ mod tests {
         assert!(channel.is_match("wechat"));
         assert!(channel.is_match("signal"));
         assert!(channel.is_match("email"));
+        assert!(channel.is_match("nostr"));
 
         // ... and so is the composite key the description tells the model to use.
         assert!(
@@ -1245,6 +1246,7 @@ mod tests {
         );
         assert!(channel.is_match("discord.team-2"));
         assert!(channel.is_match("telegram.pa_telegram"));
+        assert!(channel.is_match("nostr.home"));
 
         // Guidance is still machine-readable: unknown types stay rejected.
         assert!(!channel.is_match("sms"));

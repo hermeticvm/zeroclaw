@@ -44,6 +44,7 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "wechat",
     "signal",
     "email",
+    "nostr",
 ];
 
 /// JSON Schema `pattern` for a cron delivery channel.
