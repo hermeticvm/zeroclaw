@@ -1049,6 +1049,19 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use Markdown text; the channel sends progressive draft updates when enabled\n\
              - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
         ),
+        "nostr" => Some(
+            "When responding on Nostr:\n\
+             - Be concise and direct\n\
+             - Replies are plain text DMs; do not use attachment markers\n\
+             - When a question needs current, real-time, or external information, \
+               or the state of something your tools manage (scheduled jobs, memory), \
+               use your tools to obtain it before answering; never guess or answer \
+               from memory alone when a tool can verify it.\n\
+             - When asked to create, change, or remove something, do it with your \
+               tools; never claim a change you did not make with a tool.\n\
+             - Present the final answer directly from the tool results, without \
+               narrating internal tool-execution bookkeeping.",
+        ),
         _ => None,
     }
 }
@@ -29480,6 +29493,36 @@ BTC is currently around $65,000 based on latest tool output."#
                 "{channel_name} system prompt must include the tool-use guidance"
             );
         }
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_nostr_require_tools_for_state() {
+        let block = channel_delivery_instructions("nostr")
+            .expect("nostr channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Nostr:"),
+            "nostr block must identify itself"
+        );
+        assert!(
+            block.contains("use your tools") && block.contains("scheduled jobs"),
+            "nostr block must send questions about tool-managed state to the tools"
+        );
+        assert!(
+            block.contains("never guess or answer from memory alone"),
+            "nostr block must forbid answering from memory when a tool can verify"
+        );
+        assert!(
+            block.contains("never claim a change you did not make with a tool"),
+            "nostr block must forbid reporting changes that no tool made"
+        );
+        assert!(
+            block.contains("do not use attachment markers"),
+            "nostr replies are text only"
+        );
+
+        let prompt = build_channel_system_prompt("base prompt", "nostr", None);
+        assert!(prompt.contains("base prompt"));
+        assert!(prompt.contains("When responding on Nostr:"));
     }
 
     #[test]
